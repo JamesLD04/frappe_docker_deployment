@@ -1,60 +1,87 @@
-x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/custom-apps.md
-  # about using custom images.
-  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
-  pull_policy: ${PULL_POLICY:-always}
-  restart: ${RESTART_POLICY:-unless-stopped}
+# ------------------------------------------------------------------------------
+# ERPNext Docker Compose File for Multi-Instance Deployment via Git & Portainer
+# Target Repository: Your GitHub Fork
+#
+# Instructions for Portainer Deployment (Repository Method):
+# 1. Point Portainer to your Git fork URL.
+# 2. Set 'Compose path' to the name of this file (e.g., compose.yaml).
+# 3. Define MANDATORY Environment Variables in Portainer Stack config:
+#    - HOST_PORT: Unique host port for this instance (e.g., 8082, 8083...)
+#    - CUSTOMER_DOMAIN: Customer's full site domain (e.g., clientA.toppakss.is)
+#    - DB_ROOT_PASSWORD: Unique strong password for MariaDB root FOR THIS STACK
+# 4. Define OPTIONAL Environment Variables for reference:
+#    - ADMIN_PASSWORD: Desired password for ERPNext 'Administrator' user
+#                      (NOTE: This var is NOT used by compose, use it when running
+#                       'bench new-site' manually after deployment)
+# ------------------------------------------------------------------------------
 
-x-depends-on-configurator: &depends_on_configurator
-  depends_on:
-    configurator:
-      condition: service_completed_successfully
-
-x-backend-defaults: &backend_defaults
-  <<: [*depends_on_configurator, *customizable_image]
-  volumes:
-    - sites:/home/frappe/frappe-bench/sites
+version: "3.8"
 
 services:
-  configurator:
-    <<: *backend_defaults
-    platform: linux/amd64
-    entrypoint:
-      - bash
-      - -c
-    # add redis_socketio for backward compatibility
-    command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
-    environment:
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      REDIS_CACHE: ${REDIS_CACHE:-}
-      REDIS_QUEUE: ${REDIS_QUEUE:-}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
-    restart: on-failure
-
+  # --- Backend Service (Frappe/ERPNext Application) ---
   backend:
-    <<: *backend_defaults
-    platform: linux/amd64
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing this later if needed: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
 
+  # --- Database Service (MariaDB) ---
+  db:
+    image: mariadb:10.6
+    networks:
+      - frappe_network
+    healthcheck:
+      # Uses environment variable provided during Portainer stack deployment
+      test: mysqladmin ping -h localhost --password=${DB_ROOT_PASSWORD}
+      interval: 1s
+      retries: 20
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      # Uses environment variable provided during Portainer stack deployment
+      # !! DO NOT provide a default here to ensure it's always set explicitly !!
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+
+  # --- Frontend Service (Nginx Proxy) ---
   frontend:
-    <<: *customizable_image
-    platform: linux/amd64
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    depends_on:
+      - backend
+      - websocket
+    deploy:
+      restart_policy:
+        condition: on-failure
     command:
       - nginx-entrypoint.sh
     environment:
       BACKEND: backend:8000
       SOCKETIO: websocket:9000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      # Uses environment variable provided during Portainer stack deployment
+      FRAPPE_SITE_NAME_HEADER: ${CUSTOMER_DOMAIN}
+      # Defaults usually fine, override via Portainer Env Vars if needed
       UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
       UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
       UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
@@ -62,34 +89,115 @@ services:
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
-    depends_on:
-      - backend
-      - websocket
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      # Uses environment variable provided during Portainer stack deployment
+      # Maps container 8080 to unique host port on localhost only
+      # !! DO NOT provide a default here to ensure it's always set explicitly !!
+      - "127.0.0.1:${HOST_PORT}:8080"
 
-  websocket:
-    <<: [*depends_on_configurator, *customizable_image]
-    platform: linux/amd64
-    command:
-      - node
-      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+  # --- Queue Worker (Long Jobs) ---
+  queue-long:
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: ["bench", "worker", "--queue", "long,default,short"]
     volumes:
       - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-queue:
+        condition: service_started
 
+  # --- Queue Worker (Short Jobs) ---
   queue-short:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue short,default
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: ["bench", "worker", "--queue", "short,default"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-queue:
+        condition: service_started
 
-  queue-long:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue long,default,short
+  # --- Redis Queue Service ---
+  redis-queue:
+    image: redis:6.2-alpine
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - redis-queue-data:/data
 
+  # --- Redis Cache Service ---
+  redis-cache:
+    image: redis:6.2-alpine
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  # --- Scheduler Service ---
   scheduler:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench schedule
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: ["bench", "schedule"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
 
-# ERPNext requires local assets access (Frappe does not)
+  # --- WebSocket Service (Real-time Updates) ---
+  websocket:
+    image: frappe/erpnext:v15.60.0 # Consider parameterizing: ${ERPNEXT_VERSION:-v15.60.0}
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      redis-queue:
+        condition: service_started
+
+# --- Top-Level Volume Definitions ---
+# Named volumes ensure data persistence. Portainer will prefix with stack name.
 volumes:
+  db-data:
+  redis-queue-data:
   sites:
+  logs:
+
+# --- Top-Level Network Definition ---
+# Defines the private network for this stack's services.
+networks:
+  frappe_network:
+    driver: bridge
